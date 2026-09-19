@@ -8,12 +8,15 @@
  *
  * Required env vars:
  *   SERVICE_NAME   — Service identifier (e.g. "identity", "cook")
- *   NLB_DNS        — Internal NLB DNS name
+ *   NLB_DNS        — Internal NLB DNS name (not needed with INTEGRATION_HOST)
  *   VPC_LINK_ID    — API Gateway VPC Link ID
  *
  * Optional env vars:
  *   PATH_PREFIX    — API Gateway path prefix (default: /${SERVICE_NAME}/v1)
  *   NLB_PORT       — NLB port the service listens on (default: 3010)
+ *   INTEGRATION_HOST — HTTPS: a name the NLB TLS listener's certificate covers
+ *                    (e.g. identity-internal.tec42.io). Unset: plain http://NLB_DNS:NLB_PORT.
+ *   INTEGRATION_PORT — HTTPS: the TLS listener's port. Required with INTEGRATION_HOST.
  *   SERVICE_API_PREFIX — Service-internal API prefix (default: /api/v1)
  *   OPENAPI_SPEC   — Path to openapi.yaml (default: app/api/openapi.yaml, relative to cwd)
  *   S3_BUCKET      — S3 bucket for spec upload (default: tec42-terraform-state)
@@ -27,53 +30,7 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-
-const HTTP_METHODS = ['get', 'post', 'put', 'patch', 'delete', 'head', 'options']
-
-/**
- * Prefix all paths in an OpenAPI spec and add x-amazon-apigateway-integration extensions.
- *
- * @param {object} spec - Parsed OpenAPI spec object (mutated: paths replaced)
- * @param {object} options
- * @param {string} options.pathPrefix     - e.g. "/identity/v1"
- * @param {string} options.nlbDns         - Internal NLB DNS name
- * @param {string} options.nlbPort        - NLB port (e.g. "3010")
- * @param {string} options.serviceApiPrefix - e.g. "/api/v1"
- * @param {string} options.vpcLinkId      - API Gateway VPC Link ID
- * @returns {Record<string, unknown>} prefixedPaths
- */
-export function buildPrefixedPaths(spec, { pathPrefix, nlbDns, nlbPort, serviceApiPrefix, vpcLinkId }) {
-  const prefixedPaths = {}
-
-  for (const [path, pathItem] of Object.entries(spec.paths ?? {})) {
-    const prefixedPath = `${pathPrefix}${path}`
-
-    // Extract path parameter names, e.g. {id}, {familyId}
-    const pathParams = [...path.matchAll(/\{(\w+)\}/g)].map((m) => m[1])
-
-    for (const method of HTTP_METHODS) {
-      if (!pathItem[method]) continue
-
-      const requestParameters = {}
-      for (const param of pathParams) {
-        requestParameters[`integration.request.path.${param}`] = `method.request.path.${param}`
-      }
-
-      pathItem[method]['x-amazon-apigateway-integration'] = {
-        type: 'HTTP_PROXY',
-        httpMethod: method.toUpperCase(),
-        uri: `http://${nlbDns}:${nlbPort}${serviceApiPrefix}${path}`,
-        connectionType: 'VPC_LINK',
-        connectionId: vpcLinkId,
-        ...(Object.keys(requestParameters).length > 0 ? { requestParameters } : {}),
-      }
-    }
-
-    prefixedPaths[prefixedPath] = pathItem
-  }
-
-  return prefixedPaths
-}
+import { buildPrefixedPaths, integrationTarget } from './apigw-integrations.mjs'
 
 // --- CLI entry point ---
 {
@@ -82,7 +39,11 @@ export function buildPrefixedPaths(spec, { pathPrefix, nlbDns, nlbPort, serviceA
   const NLB_DNS = process.env.NLB_DNS
   const VPC_LINK_ID = process.env.VPC_LINK_ID
 
-  const missing = ['SERVICE_NAME', 'NLB_DNS', 'VPC_LINK_ID'].filter((k) => !process.env[k])
+  // NLB_DNS only feeds the plain-HTTP target; an HTTPS integration names its host instead.
+  const required = process.env.INTEGRATION_HOST
+    ? ['SERVICE_NAME', 'VPC_LINK_ID']
+    : ['SERVICE_NAME', 'NLB_DNS', 'VPC_LINK_ID']
+  const missing = required.filter((k) => !process.env[k])
   if (missing.length > 0) {
     console.error(`❌ Missing required env vars: ${missing.join(', ')}`)
     process.exit(1)
@@ -98,6 +59,19 @@ export function buildPrefixedPaths(spec, { pathPrefix, nlbDns, nlbPort, serviceA
   const DRY_RUN = !!process.env.DRY_RUN
   const OUTPUT_FILE = process.env.OUTPUT_FILE ?? null
 
+  let TARGET
+  try {
+    TARGET = integrationTarget({
+      nlbDns: NLB_DNS,
+      nlbPort: NLB_PORT,
+      integrationHost: process.env.INTEGRATION_HOST,
+      integrationPort: process.env.INTEGRATION_PORT,
+    })
+  } catch (error) {
+    console.error(`❌ ${error.message}`)
+    process.exit(1)
+  }
+
   const cwd = process.cwd()
   const specPath = resolve(cwd, OPENAPI_SPEC)
 
@@ -109,7 +83,7 @@ export function buildPrefixedPaths(spec, { pathPrefix, nlbDns, nlbPort, serviceA
   console.log(`🚀 Bundling OpenAPI spec for service: ${SERVICE_NAME}`)
   console.log(`   Spec:       ${specPath}`)
   console.log(`   Prefix:     ${PATH_PREFIX}`)
-  console.log(`   NLB target: http://${NLB_DNS}:${NLB_PORT}${SERVICE_API_PREFIX}`)
+  console.log(`   NLB target: ${TARGET}${SERVICE_API_PREFIX}`)
   if (DRY_RUN) console.log('   Mode:       DRY RUN (no S3 upload)')
   if (OUTPUT_FILE) console.log(`   Output:     ${OUTPUT_FILE} (no S3 upload)`)
   // Step 1: Bundle OpenAPI spec (resolve all $refs via redocly)
@@ -141,8 +115,7 @@ export function buildPrefixedPaths(spec, { pathPrefix, nlbDns, nlbPort, serviceA
   // Step 2: Prefix all paths + add x-amazon-apigateway-integration
   const prefixedPaths = buildPrefixedPaths(spec, {
     pathPrefix: PATH_PREFIX,
-    nlbDns: NLB_DNS,
-    nlbPort: NLB_PORT,
+    target: TARGET,
     serviceApiPrefix: SERVICE_API_PREFIX,
     vpcLinkId: VPC_LINK_ID,
   })
