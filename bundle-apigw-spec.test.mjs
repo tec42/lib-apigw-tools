@@ -173,18 +173,7 @@ describe('buildPrefixedPaths', () => {
 describe('integrationTarget', () => {
   const NLB = { nlbDns: 'test-nlb.internal.example.com', nlbPort: '3010' }
 
-  it('stays plain http://NLB_DNS:NLB_PORT when no integration host is given', () => {
-    assert.equal(integrationTarget(NLB), 'http://test-nlb.internal.example.com:3010')
-  })
-
-  it('treats empty strings as unset, as an empty Makefile variable arrives', () => {
-    assert.equal(
-      integrationTarget({ ...NLB, integrationHost: '', integrationPort: '' }),
-      'http://test-nlb.internal.example.com:3010',
-    )
-  })
-
-  it('switches to https://INTEGRATION_HOST:INTEGRATION_PORT and ignores the NLB name', () => {
+  it('builds https://INTEGRATION_HOST:INTEGRATION_PORT, the default shape', () => {
     assert.equal(
       integrationTarget({
         ...NLB,
@@ -195,10 +184,28 @@ describe('integrationTarget', () => {
     )
   })
 
-  it('needs no NLB name in HTTPS mode', () => {
+  it('needs no NLB name for HTTPS', () => {
     assert.equal(
       integrationTarget({ integrationHost: 'catalog-internal.tec42.io', integrationPort: '3022' }),
       'https://catalog-internal.tec42.io:3022',
+    )
+  })
+
+  it('refuses to fall back to plain HTTP when neither host nor port is given', () => {
+    assert.throws(
+      () => integrationTarget(NLB),
+      /INTEGRATION_HOST and INTEGRATION_PORT are required: services talk HTTPS only/,
+    )
+  })
+
+  it('refuses when called with nothing at all', () => {
+    assert.throws(() => integrationTarget(), /required/)
+  })
+
+  it('treats empty strings as unset, as an empty Makefile variable arrives', () => {
+    assert.throws(
+      () => integrationTarget({ ...NLB, integrationHost: '', integrationPort: '' }),
+      /required/,
     )
   })
 
@@ -237,5 +244,52 @@ describe('integrationTarget', () => {
         }),
       /raw NLB name/,
     )
+  })
+
+  describe('the plaintext opt-out', () => {
+    it('emits http:// when a reason is given and the NLB is named in full', () => {
+      assert.equal(
+        integrationTarget({ ...NLB, allowPlaintext: 'a service that has no TLS listener yet' }),
+        'http://test-nlb.internal.example.com:3010',
+      )
+    })
+
+    it('needs the port spelled out — there is no 3010 default any more', () => {
+      assert.throws(
+        () => integrationTarget({ nlbDns: 'test-nlb.internal.example.com', allowPlaintext: 'why' }),
+        /Plaintext mode needs NLB_PORT/,
+      )
+    })
+
+    it('needs the NLB name spelled out too', () => {
+      assert.throws(
+        () => integrationTarget({ nlbPort: '3010', allowPlaintext: 'why' }),
+        /Plaintext mode needs NLB_DNS/,
+      )
+    })
+
+    it('refuses a port that is not a number', () => {
+      assert.throws(
+        () => integrationTarget({ nlbDns: 'nlb', nlbPort: 'three thousand', allowPlaintext: 'why' }),
+        /NLB_PORT must be a port number/,
+      )
+    })
+
+    it('refuses to be combined with INTEGRATION_HOST, rather than picking one silently', () => {
+      assert.throws(
+        () =>
+          integrationTarget({
+            ...NLB,
+            integrationHost: 'identity-internal.tec42.io',
+            integrationPort: '3012',
+            allowPlaintext: 'why',
+          }),
+        /decide one/,
+      )
+    })
+
+    it('treats an empty reason as no opt-out', () => {
+      assert.throws(() => integrationTarget({ ...NLB, allowPlaintext: '' }), /required/)
+    })
   })
 })
