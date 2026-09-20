@@ -8,15 +8,16 @@
  *
  * Required env vars:
  *   SERVICE_NAME   — Service identifier (e.g. "identity", "cook")
- *   NLB_DNS        — Internal NLB DNS name (not needed with INTEGRATION_HOST)
  *   VPC_LINK_ID    — API Gateway VPC Link ID
+ *   INTEGRATION_HOST — a name the NLB TLS listener's certificate covers
+ *                    (e.g. identity-internal.tec42.io)
+ *   INTEGRATION_PORT — that listener's port (e.g. 3012)
  *
  * Optional env vars:
  *   PATH_PREFIX    — API Gateway path prefix (default: /${SERVICE_NAME}/v1)
- *   NLB_PORT       — NLB port the service listens on (default: 3010)
- *   INTEGRATION_HOST — HTTPS: a name the NLB TLS listener's certificate covers
- *                    (e.g. identity-internal.tec42.io). Unset: plain http://NLB_DNS:NLB_PORT.
- *   INTEGRATION_PORT — HTTPS: the TLS listener's port. Required with INTEGRATION_HOST.
+ *   INTEGRATION_ALLOW_PLAINTEXT — the reason this caller has to emit http:// instead. Then NLB_DNS
+ *                    and NLB_PORT are required and there is no default for either.
+ *   NLB_DNS, NLB_PORT — the internal NLB name and port, plaintext mode only
  *   SERVICE_API_PREFIX — Service-internal API prefix (default: /api/v1)
  *   OPENAPI_SPEC   — Path to openapi.yaml (default: app/api/openapi.yaml, relative to cwd)
  *   S3_BUCKET      — S3 bucket for spec upload (default: tec42-terraform-state)
@@ -38,11 +39,14 @@ import { buildPrefixedPaths, integrationTarget } from './apigw-integrations.mjs'
   const SERVICE_NAME = process.env.SERVICE_NAME
   const NLB_DNS = process.env.NLB_DNS
   const VPC_LINK_ID = process.env.VPC_LINK_ID
+  const ALLOW_PLAINTEXT = process.env.INTEGRATION_ALLOW_PLAINTEXT
 
-  // NLB_DNS only feeds the plain-HTTP target; an HTTPS integration names its host instead.
-  const required = process.env.INTEGRATION_HOST
-    ? ['SERVICE_NAME', 'VPC_LINK_ID']
-    : ['SERVICE_NAME', 'NLB_DNS', 'VPC_LINK_ID']
+  // HTTPS is the default: INTEGRATION_HOST and INTEGRATION_PORT are required unless this caller has
+  // explicitly opted out with a reason, and then it names the NLB itself. integrationTarget() below
+  // says the same thing with a longer message; this keeps "what must be set" in one list.
+  const required = ALLOW_PLAINTEXT
+    ? ['SERVICE_NAME', 'VPC_LINK_ID', 'NLB_DNS', 'NLB_PORT']
+    : ['SERVICE_NAME', 'VPC_LINK_ID', 'INTEGRATION_HOST', 'INTEGRATION_PORT']
   const missing = required.filter((k) => !process.env[k])
   if (missing.length > 0) {
     console.error(`❌ Missing required env vars: ${missing.join(', ')}`)
@@ -51,7 +55,7 @@ import { buildPrefixedPaths, integrationTarget } from './apigw-integrations.mjs'
 
   // Optional env vars with defaults
   const PATH_PREFIX = process.env.PATH_PREFIX ?? `/${SERVICE_NAME}/v1`
-  const NLB_PORT = process.env.NLB_PORT ?? '3010'
+  const NLB_PORT = process.env.NLB_PORT
   const SERVICE_API_PREFIX = process.env.SERVICE_API_PREFIX ?? '/api/v1'
   const OPENAPI_SPEC = process.env.OPENAPI_SPEC ?? 'app/api/openapi.yaml'
   const S3_BUCKET = process.env.S3_BUCKET ?? 'tec42-terraform-state'
@@ -66,6 +70,7 @@ import { buildPrefixedPaths, integrationTarget } from './apigw-integrations.mjs'
       nlbPort: NLB_PORT,
       integrationHost: process.env.INTEGRATION_HOST,
       integrationPort: process.env.INTEGRATION_PORT,
+      allowPlaintext: ALLOW_PLAINTEXT,
     })
   } catch (error) {
     console.error(`❌ ${error.message}`)
@@ -84,6 +89,7 @@ import { buildPrefixedPaths, integrationTarget } from './apigw-integrations.mjs'
   console.log(`   Spec:       ${specPath}`)
   console.log(`   Prefix:     ${PATH_PREFIX}`)
   console.log(`   NLB target: ${TARGET}${SERVICE_API_PREFIX}`)
+  if (ALLOW_PLAINTEXT) console.log(`   ⚠️  Plaintext, by decision: ${ALLOW_PLAINTEXT}`)
   if (DRY_RUN) console.log('   Mode:       DRY RUN (no S3 upload)')
   if (OUTPUT_FILE) console.log(`   Output:     ${OUTPUT_FILE} (no S3 upload)`)
   // Step 1: Bundle OpenAPI spec (resolve all $refs via redocly)
